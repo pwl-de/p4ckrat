@@ -13,9 +13,6 @@ import subprocess
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# ============================================================================
-#  CONFIG  --  hier anpassen
-# ============================================================================
 SCRIPT_DIR = Path(__file__).resolve().parent
 
 def _find_seclists():
@@ -25,35 +22,29 @@ def _find_seclists():
               Path("/usr/share/wordlists/seclists")):
         if p.exists():
             return p
-    return Path("/usr/share/seclists")          # Kali-Default als Fallback
+    return Path("/usr/share/seclists")
 SECLISTS = _find_seclists()
 
-# Web-Dir-Fuzzing Wordlist (dein Standard). Fuer die Rekursion wird bewusst eine
-# kleinere Liste genommen, damit es schnell bleibt.
-# Fuer Speed: kleinere Dir-Liste + wenige Endungen (jede Endung = x Requests!).
-# Fuer mehr Coverage auf raft-medium-directories.txt hochstellen.
 WORDLIST         = SECLISTS/"Discovery"/"Web-Content"/"raft-small-directories.txt"
 RECURSE_WORDLIST = SECLISTS/"Discovery"/"Web-Content"/"common.txt"
 DNS_WORDLIST     = SECLISTS/"Discovery"/"DNS"/"subdomains-top1million-5000.txt"
 USER_WORDLIST    = SECLISTS/"Usernames"/"top-usernames-shortlist.txt"
 PASS_WORDLIST    = SECLISTS/"Passwords"/"Common-Credentials"/"10-million-password-list-top-100.txt"
 
-DOMAIN         = ""        # leer = automatisch raten (Redirect/Cert/LDAP)
-
-RATE           = 5000      # nmap --min-rate
-THREADS        = 80        # gobuster/ffuf threads
-CONCURRENCY    = 4         # parallele Enum-Phasen
-GOBUSTER_DEPTH = 2         # Rekursionstiefe (0 = aus)
-GOBUSTER_BUDGET= 12        # max. Gesamt-Anzahl gobuster-Laeufe (gegen Explosion)
-GOBUSTER_EXT   = "php,txt"  # weniger = schneller; leer "" = gar keine
+DOMAIN         = ""
+RATE           = 5000
+THREADS        = 80
+CONCURRENCY    = 4
+GOBUSTER_DEPTH = 2
+GOBUSTER_BUDGET = 12
+GOBUSTER_EXT   = "php,txt"
 
 ENABLE_GOBUSTER  = True
 ENABLE_DIRSEARCH = True
-ENABLE_VHOST     = True     # vHost/Subdomain-Fuzzing via ffuf + Rekursion
-ENABLE_HOSTS     = True     # /etc/hosts automatisch ergaenzen (braucht root)
-DO_WEBFUZZ       = True     # Laufzeit: per y/n-Abfrage gesetzt (siehe main)
+ENABLE_VHOST     = True
+ENABLE_HOSTS     = True
+DO_WEBFUZZ       = True
 
-# Timeouts (Sekunden) pro einzelnem Tool-Lauf:
 T_FULLSCAN = 480
 T_SVCSCAN  = 360
 T_GOBUSTER = 420
@@ -61,12 +52,9 @@ T_DIRSRCH  = 420
 T_HYDRA    = 600
 T_GENERIC  = 180
 
-# ============================================================================
-#  OUTPUT  -  technische Palette, thread-safe, live
-# ============================================================================
 _P = {"g":"\033[32m","G":"\033[92m","c":"\033[36m","C":"\033[96m",
       "y":"\033[33m","Y":"\033[93m","r":"\033[91m","w":"\033[97m",
-      "d":"\033[90m","b":"\033[1m","u":"\033[4m","0":"\033[0m"}
+      "d":"\033[90m","b":"\033[1m","0":"\033[0m"}
 if not sys.stdout.isatty() or os.environ.get("NO_COLOR"):
     _P = {k:"" for k in _P}
 def col(k,s): return f"{_P[k]}{s}{_P['0']}"
@@ -74,8 +62,8 @@ def col(k,s): return f"{_P[k]}{s}{_P['0']}"
 _LOCK = threading.Lock()
 _T0 = time.monotonic()
 _ANSI = re.compile(r"\033\[[0-9;]*m")
-_LOGF = None        # voller Lauf-Log (Konsole 1:1, ohne Farbe)
-_FINDF = None       # kuratiertes Live-Findings-File
+_LOGF = None
+_FINDF = None
 def _ts(): return time.strftime("%H:%M:%S")
 def _el(): return f"{time.monotonic()-_T0:.0f}s"
 def emit(s=""):
@@ -88,32 +76,29 @@ def emit(s=""):
 def set_logs(logf, findf):
     global _LOGF, _FINDF; _LOGF, _FINDF = logf, findf
 
-# stabile Farbe pro Phase, damit paralleler Output optisch trennbar ist
 _TAGCOL = {}
-_PALETTE = ["C","G","Y","c","g","b"]
+_PALETTE = ["c","G","Y","g","C","y"]
 def _tagcolor(t):
     if t not in _TAGCOL: _TAGCOL[t] = _PALETTE[len(_TAGCOL) % len(_PALETTE)]
     return _TAGCOL[t]
-def _lead(t):
-    return "  " + (col(_tagcolor(t), f"{t:>7}") if t else " "*7) + "  "
+def _pfx(t): return col(_tagcolor(t), t)+" " if t else ""
 
-def info(s, t=None): emit(_lead(t)+col("d","› ")+s)
-def ok(s,   t=None): emit(_lead(t)+col("G","✓ ")+col("w",s))
-def warn(s, t=None): emit(_lead(t)+col("Y","‼ ")+s)
-def err(s,  t=None): emit(_lead(t)+col("r","✗ ")+s)
-def raw(line, t=None): emit(_lead(t)+col("d",line))
+def info(s, t=None): emit(col("c","[*] ")+_pfx(t)+s)
+def ok(s,   t=None): emit(col("G","[+] ")+_pfx(t)+col("w",s))
+def warn(s, t=None): emit(col("Y","[!] ")+_pfx(t)+s)
+def err(s,  t=None): emit(col("r","[-] ")+_pfx(t)+s)
+def raw(line, t=None): emit("    "+_pfx(t)+col("d",line))
 
 def finding(cat, text, t=None):
-    """Kuratiertes Highlight: in die Konsole + live ins Findings-File."""
     if _FINDF:
         with _LOCK:
             try: _FINDF.write(f"[{_ts()}] {cat:<6} {text}\n"); _FINDF.flush()
             except Exception: pass
-    emit(_lead(t)+col("Y","★ ")+col("b",col("w",f"{cat}  "))+col("w",text))
+    emit(col("G","[+] ")+col(_tagcolor(t) if t else "G", cat.lower()+": ")+col("w",text))
 
 def head(s):
     emit()
-    emit(col("g","▌")+col("b",col("w"," "+s.upper()))+"  "+col("d","─"*max(3, 52-len(s))))
+    emit(col("b",s.lower()))
 
 BANNER = r"""
           _____          __                   __
@@ -124,18 +109,14 @@ ______   /  |  |   ____ |  | ______________ _/  |_
 |__|        |__|      \/     \/            \/"""
 def banner(ip, name):
     emit(col("G", col("b", BANNER)))
-    emit(col("d","   full-auto recon & loot grabber  ")+col("g","·")+col("d","  by p4cket"))
-    emit(col("g","  "+"═"*54))
-    emit(col("d","   target   ")+col("w",f"{ip}")+col("d","   name ")+col("w",name)
-         +col("d","   started ")+col("w",_ts()))
-    emit(col("d","   wordlist ")+col("w",WORDLIST.name)+col("d","   lists ")+col("w",str(SECLISTS)))
-    emit(col("g","  "+"═"*54))
+    emit(col("d","   full-auto recon & loot grabber - by p4cket - github.com/pwl-de"))
+    emit(col("d",f"   target {ip}   name {name}   started {_ts()}"))
+    emit(col("d",f"   wordlist {WORDLIST.name}   lists {SECLISTS}"))
+    emit()
 
 def have(tool): return shutil.which(tool) is not None
 
-# ---------------------------------------------------------------------------
 def run(cmd, outfile=None, timeout=T_GENERIC):
-    """Silent capture - fuer schnelle Parse-Kommandos."""
     try:
         p = subprocess.run(cmd, capture_output=True, text=True,
                            timeout=timeout, errors="replace")
@@ -155,7 +136,7 @@ def run_live(cmd, t=None, outfile=None, timeout=T_GENERIC, filt=None, echo=True)
         p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                              text=True, errors="replace", bufsize=1)
     except FileNotFoundError:
-        warn(f"nicht installiert: {cmd[0]}", t); return (127, "")
+        warn(f"not installed: {cmd[0]}", t); return (127, "")
     killer = threading.Timer(timeout, p.kill); killer.start()
     buf = []
     try:
@@ -171,9 +152,6 @@ def run_live(cmd, t=None, outfile=None, timeout=T_GENERIC, filt=None, echo=True)
     if outfile: Path(outfile).write_text(text, errors="replace")
     return (p.returncode or 0, text)
 
-# ---------------------------------------------------------------------------
-#  Credential hunting
-# ---------------------------------------------------------------------------
 CRED_RE = re.compile("|".join([
     r"-----BEGIN (?:RSA|OPENSSH|DSA|EC|PGP) PRIVATE KEY-----",
     r"pass(?:word|wd|phrase)?\s*[:=]\s*\S+",
@@ -209,13 +187,10 @@ def scan_creds(root, report):
         if len(hits) > 20: emit(f"   {col('d','... +'+str(len(hits)-20)+' weitere')}")
     return hits
 
-# ---------------------------------------------------------------------------
-#  Phasen
-# ---------------------------------------------------------------------------
 def portscan(ip, out):
     head("PORT-SCAN")
     gfile = out/"scans"/"all-ports.gnmap"
-    info("Full-TCP-Scan (alle 65535 Ports, live) ...", "nmap")
+    info("full port scan (all 65535 ports)", "nmap")
     run_live(["nmap","-p-","--min-rate",str(RATE),"-T4","-Pn","-n","-v",
               "-oG",str(gfile),"-oN",str(out/"scans"/"all-ports.txt"), ip],
              t="nmap", timeout=T_FULLSCAN,
@@ -223,12 +198,12 @@ def portscan(ip, out):
     ports = sorted({m.group(1) for m in re.finditer(r"(\d+)/open",
                     gfile.read_text(errors="replace"))} if gfile.exists() else set(), key=int)
     if not ports:
-        warn("Keine offenen TCP-Ports - versuche UDP-Top-50 ...", "nmap")
+        warn("no open tcp ports, trying udp top-50", "nmap")
         run_live(["nmap","-sU","--top-ports","50","-Pn","-n","-oN",
                   str(out/"scans"/"udp.txt"), ip], t="nmap", timeout=T_SVCSCAN)
         return {}, ""
     ok("Offene Ports: "+col("G",", ".join(ports)), "nmap")
-    info("Service-/Script-Scan auf offenen Ports ...", "nmap")
+    info("service scan on open ports", "nmap")
     _, svc = run_live(["nmap","-p",",".join(ports),"-sCV","-Pn","-n","-oN",
                        str(out/"scans"/"services.txt"), ip], t="nmap", timeout=T_SVCSCAN,
                       filt=lambda l: bool(re.match(r"\d+/tcp", l)) or "|" in l)
@@ -267,15 +242,15 @@ def add_host(ip, host):
             warn(f"/etc/hosts: {e}", "hosts")
 
 def ftp_anon(ip, out):
-    info("probe anonymous FTP (21)", "ftp")
+    info("checking anonymous ftp", "ftp")
     dest = out/"files"/"ftp"; dest.mkdir(parents=True, exist_ok=True)
     try:
         ftp = ftplib.FTP(); ftp.connect(ip, 21, timeout=15)
         ftp.login("anonymous","anonymous@")
-        finding("FTP", "anonymous login erlaubt", "ftp")
-        ok("Anonymous-Login OK - ziehe rekursiv alle Files ...", "ftp")
+        finding("FTP", "anonymous login allowed", "ftp")
+        ok("anonymous login ok, downloading all files", "ftp")
     except Exception as e:
-        warn(f"Kein Anon-FTP: {e}", "ftp"); return
+        warn(f"no anon ftp: {e}", "ftp"); return
     n = [0]
     def pull(path=""):
         try: items = ftp.nlst(path)
@@ -289,13 +264,13 @@ def ftp_anon(ip, out):
                 local = dest/name.lstrip("/"); local.parent.mkdir(parents=True, exist_ok=True)
                 try:
                     with open(local,"wb") as fh: ftp.retrbinary("RETR "+name, fh.write)
-                    n[0]+=1; emit(_gutter("ftp")+col("G","GET ")+name)
+                    n[0]+=1; raw("get "+name, "ftp")
                 except Exception: pass
     try: pull()
     finally:
         try: ftp.quit()
         except Exception: pass
-    ok(f"{n[0]} Datei(en) -> {dest}", "ftp")
+    ok(f"{n[0]} file(s) -> {dest}", "ftp")
 
 def smb_anon(ip, out):
     info("enumerate SMB (139/445)", "smb")
@@ -304,16 +279,16 @@ def smb_anon(ip, out):
         run_live(["smbmap","-H",ip], t="smb", outfile=out/"scans"/"smbmap.txt",
                  timeout=T_GENERIC, filt=lambda l: "READ" in l or "Disk" in l or "ANONYMOUS" in l)
     if not have("smbclient"):
-        warn("smbclient fehlt - SMB-Grab uebersprungen", "smb"); return
+        warn("smbclient missing, skipping share grab", "smb"); return
     _, listing = run(["smbclient","-N","-L",f"//{ip}/"], timeout=T_GENERIC)
     shares = [s for s in re.findall(r"^\s*(\S+)\s+Disk", listing, re.M)
               if s.upper() not in ("ADMIN$","IPC$","C$","PRINT$")]
     if not shares:
-        warn("Keine lesbaren Shares", "smb"); return
-    finding("SMB", "lesbare Shares: "+", ".join(shares), "smb")
+        warn("no readable shares", "smb"); return
+    finding("SMB", "readable shares: "+", ".join(shares), "smb")
     for sh in shares:
         sdir = dest/sh; sdir.mkdir(parents=True, exist_ok=True)
-        info(f"Grabbe Share '{sh}' ...", "smb")
+        info(f"grabbing share '{sh}'", "smb")
         run(["smbclient","-N",f"//{ip}/{sh}","-c",
              f"recurse ON; prompt OFF; lcd {sdir}; mget *"], timeout=T_GENERIC)
     ok(f"SMB-Files -> {dest}", "smb")
@@ -332,7 +307,7 @@ def _parse_gobuster(text):
 
 def gobuster_recursive(base, wd, tag, budget):
     if not (ENABLE_GOBUSTER and have("gobuster") and WORDLIST.exists()):
-        if not have("gobuster"): warn("gobuster fehlt", tag)
+        if not have("gobuster"): warn("gobuster missing", tag)
         return
     seen = set(); queue = [(base.rstrip("/")+"/", 0)]
     while queue and budget[0] > 0:
@@ -358,7 +333,7 @@ def gobuster_recursive(base, wd, tag, budget):
 def vhost_scan(ip, port, scheme, root, wd, tag):
     if not (ENABLE_VHOST and have("ffuf") and DNS_WORDLIST.exists()): return []
     outj = wd/"vhosts.json"
-    info(f"vHost-Fuzzing FUZZ.{root} ...", tag)
+    info(f"vhost fuzzing FUZZ.{root}", tag)
     run_live(["ffuf","-w",str(DNS_WORDLIST),"-u",f"{scheme}://{ip}:{port}/",
               "-H",f"Host: FUZZ.{root}","-t",str(THREADS),"-ac","-s",
               "-of","json","-o",str(outj)], t=tag, timeout=T_GOBUSTER,
@@ -388,7 +363,7 @@ def web(ip, port, out, host):
             if tt: info(f"{url}  <title> {tt.group(1).strip()[:70]}", tag)
             for m in list(re.finditer(r"(?i)(password|username|api[_-]?key|todo|flag|<!--.*?-->)", body))[:6]:
                 s = m.group(0).strip().replace("\n"," ")[:120]
-                if s: emit(_lead(tag)+col("Y","hint ")+col("d",s))
+                if s: raw("hint "+s, tag)
     if not DO_WEBFUZZ:
         return
     # vHosts -> /etc/hosts -> auch fuzzen
@@ -418,7 +393,7 @@ def kerberos(ip, out, host):
         m = re.search(r"DC=([A-Za-z0-9\-]+),DC=([A-Za-z0-9\-]+)", o)
         if m: dom = f"{m.group(1)}.{m.group(2)}"
     if not dom:
-        warn("Domain unbekannt - setze DOMAIN in CONFIG. Ueberspringe.", "krb"); return
+        warn("domain unknown, set DOMAIN in config, skipping", "krb"); return
     ok(f"Domain: {dom}", "krb")
     users = out/"users.txt"
     if have("kerbrute") and USER_WORDLIST.exists():
@@ -429,7 +404,7 @@ def kerberos(ip, out, host):
         found = sorted(set(re.findall(r"VALID USERNAME:\s+([^@\s]+)", o)))
         if found:
             users.write_text("\n".join(found)+"\n")
-            finding("KRB", "valide User: "+", ".join(found), "krb")
+            finding("KRB", "valid users: "+", ".join(found), "krb")
     if not users.exists() and USER_WORDLIST.exists():
         shutil.copy(USER_WORDLIST, users)
     gnp = shutil.which("GetNPUsers.py") or shutil.which("impacket-GetNPUsers")
@@ -446,16 +421,16 @@ def hydra_prompt(ip, svcmap, out):
     if "22" in svcmap or any("ssh" in n for n,_ in svcmap.values()): svcs.append(("ssh","22"))
     if "21" in svcmap or any("ftp" in n for n,_ in svcmap.values()): svcs.append(("ftp","21"))
     if not (svcs and have("hydra")):
-        if svcs and not have("hydra"): warn("hydra nicht installiert - Brute uebersprungen")
+        if svcs and not have("hydra"): warn("hydra not installed, skipping brute")
         return
     users = out/"users.txt"
     ulist = str(users) if users.exists() else str(USER_WORDLIST)
     emit()
-    if not ask(f"Hydra gegen {', '.join(s for s,_ in svcs)} starten? "
-               +col("d",f"({Path(ulist).name} × {PASS_WORDLIST.name})"), default="n"):
-        info("Hydra uebersprungen."); return
+    if not ask(f"run hydra against {', '.join(s for s,_ in svcs)}? "
+               +col("d",f"({Path(ulist).name} x {PASS_WORDLIST.name})"), default="n"):
+        info("hydra skipped"); return
     if not (Path(ulist).exists() and PASS_WORDLIST.exists()):
-        warn("User-/Pass-Liste fehlt."); return
+        warn("user/pass list missing"); return
     for name, port in svcs:
         head(f"HYDRA {name}")
         _, o = run_live(["hydra","-L",ulist,"-P",str(PASS_WORDLIST),"-t","4","-f","-I",
@@ -464,11 +439,9 @@ def hydra_prompt(ip, svcmap, out):
         for m in re.finditer(r"login:\s*(\S+)\s+password:\s*(\S+)", o):
             finding("CREDS", f"{name}  {m.group(1)}:{m.group(2)}", "hydra")
 
-# ---------------------------------------------------------------------------
 def ask(q, default="n"):
-    """y/n-Frage; bei non-interactive wird default genommen."""
     try:
-        a = input(_lead(None)+col("Y","? ")+q+col("d",f" [{'Y/n' if default=='y' else 'y/N'}] ")).strip().lower()
+        a = input(col("Y","[?] ")+q+col("d",f" [{'Y/n' if default=='y' else 'y/N'}] ")).strip().lower()
     except EOFError:
         a = ""
     return (a or default) == "y"
@@ -482,33 +455,32 @@ def main():
 
     logf  = open(out/"p4ckrat.log", "w", encoding="utf-8")
     findf = open(out/"findings.txt", "w", encoding="utf-8")
-    findf.write(f"# p4ckrat findings  ·  {ip} ({name})  ·  {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
-                f"# live-updated während des Laufs\n\n"); findf.flush()
+    findf.write(f"# p4ckrat findings - {ip} ({name}) - {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+    findf.flush()
     set_logs(logf, findf)
 
     banner(ip, name)
     info(f"live findings  -> {out}/findings.txt", None)
     info(f"full log       -> {out}/p4ckrat.log", None)
-    if not have("nmap"): err("nmap fehlt - Abbruch."); sys.exit(1)
+    if not have("nmap"): err("nmap missing, abort"); sys.exit(1)
 
     svcmap, svc = portscan(ip, out)
     if not svcmap:
-        warn("Keine offenen Ports - nichts zu tun."); return
+        warn("no open ports, nothing to do"); return
     finding("PORTS", ", ".join(f"{p}/{svcmap[p][0]}" for p in sorted(svcmap, key=int)))
     host = guess_hostname(ip, svc)
     if host:
-        ok(f"Hostname erkannt: {col('G',host)}"); finding("HOST", host); add_host(ip, host)
+        finding("HOST", host); add_host(ip, host)
 
     web_ports = [p for p,(n,_) in svcmap.items()
                  if "http" in n or p in ("80","443","8080","8000","8443","8081")]
 
-    # --- Web-Fuzzing optional ---
     global DO_WEBFUZZ
     if web_ports:
-        DO_WEBFUZZ = ask(f"Web-Fuzzing (gobuster+dirsearch+vhost) auf Port {', '.join(web_ports)} starten?",
+        DO_WEBFUZZ = ask(f"run web fuzzing (gobuster+dirsearch+vhost) on port {', '.join(web_ports)}?",
                          default="y")
         if not DO_WEBFUZZ:
-            info("Web-Fuzzing übersprungen (nur Index/Header werden geholt).")
+            info("web fuzzing skipped (only index/headers fetched)")
 
     head("ENUM (parallel)")
     workers = list(filter(None,[
@@ -516,7 +488,7 @@ def main():
         "smb" if ("445" in svcmap or "139" in svcmap) else "",
         *[f"web:{p}" for p in web_ports],
         "kerberos" if "88" in svcmap else ""]))
-    info(f"{CONCURRENCY} parallele Worker: "+col("w",", ".join(workers)))
+    info(f"{CONCURRENCY} workers: "+col("w",", ".join(workers)))
     jobs = []
     with ThreadPoolExecutor(max_workers=CONCURRENCY) as ex:
         if "21" in svcmap: jobs.append(ex.submit(ftp_anon, ip, out))
@@ -525,7 +497,7 @@ def main():
         if "88" in svcmap: jobs.append(ex.submit(kerberos, ip, out, host))
         for f in as_completed(jobs):
             try: f.result()
-            except Exception as e: err(f"Phase-Fehler: {e!r}")
+            except Exception as e: err(f"phase error: {e!r}")
 
     head("CREDENTIAL-SCAN")
     for h in scan_creds(out/"files", out/"creds_files.txt"): finding("CREDS", h[:160])
@@ -534,9 +506,11 @@ def main():
     hydra_prompt(ip, svcmap, out)
 
     head("DONE")
-    ok(f"p4ckrat fertig in {_el()}  ->  {col('G',str(out))}/")
-    emit(col("d","   review: ")+col("w",f"{out}/findings.txt")+col("d","  (live findings)"))
-    emit(col("d","           ")+col("w",f"{out}/scans/services.txt  ·  {out}/web/  ·  {out}/files/"))
+    ok(f"done in {_el()} -> {col('G',str(out))}/")
+    info(col("w",f"{out}/findings.txt")+col("d","  (live findings)"))
+    info(col("w",f"{out}/scans/services.txt")+col("d","  ")+col("w",f"{out}/web/")
+         +col("d","  ")+col("w",f"{out}/files/"))
+    emit()
     try: logf.close(); findf.close()
     except Exception: pass
 
