@@ -3,11 +3,10 @@ r"""p4ckrat - full-auto recon & loot grabber (by p4cket). See README.md."""
 import os
 import re
 import sys
-import json
 import time
 import shutil
-import socket
 import ftplib
+import tempfile
 import threading
 import subprocess
 from pathlib import Path
@@ -27,28 +26,22 @@ SECLISTS = _find_seclists()
 
 WORDLIST         = SECLISTS/"Discovery"/"Web-Content"/"raft-small-directories.txt"
 RECURSE_WORDLIST = SECLISTS/"Discovery"/"Web-Content"/"common.txt"
-DNS_WORDLIST     = SECLISTS/"Discovery"/"DNS"/"subdomains-top1million-5000.txt"
 USER_WORDLIST    = SECLISTS/"Usernames"/"top-usernames-shortlist.txt"
 PASS_WORDLIST    = SECLISTS/"Passwords"/"Common-Credentials"/"10-million-password-list-top-100.txt"
 
-DOMAIN         = ""
-RATE           = 5000
-THREADS        = 80
-CONCURRENCY    = 4
-GOBUSTER_DEPTH = 2
-GOBUSTER_BUDGET = 12
-GOBUSTER_EXT   = "php,txt"
-
-ENABLE_GOBUSTER  = True
-ENABLE_DIRSEARCH = True
-ENABLE_VHOST     = True
-ENABLE_HOSTS     = True
-DO_WEBFUZZ       = True
+DOMAIN          = ""
+RATE            = 5000
+THREADS         = 80
+CONCURRENCY     = 4
+ENABLE_HOSTS    = True
+GOBUSTER_DEPTH  = 2          # Rekursionstiefe fuer gefundene Verzeichnisse
+GOBUSTER_BUDGET = 12         # max. Anzahl gobuster-Laeufe gesamt (Explosionsschutz)
+GOBUSTER_EXT    = "php,txt"  # angehaengte Datei-Endungen (leer = aus)
+DO_GOBUSTER     = True       # wird beim Start per Abfrage gesetzt
 
 T_FULLSCAN = 480
 T_SVCSCAN  = 360
 T_GOBUSTER = 420
-T_DIRSRCH  = 420
 T_HYDRA    = 600
 T_GENERIC  = 180
 
@@ -107,11 +100,11 @@ ______   /  |  |   ____ |  | ______________ _/  |_
 |  |_> >    ^   /\  \___|    <  |  | \// __ \|  |
 |   __/\____   |  \___  >__|_ \ |__|  (____  /__|
 |__|        |__|      \/     \/            \/"""
-def banner(ip, name):
+def banner(ip):
     emit(col("G", col("b", BANNER)))
     emit(col("d","   full-auto recon & loot grabber - by p4cket - github.com/pwl-de"))
-    emit(col("d",f"   target {ip}   name {name}   started {_ts()}"))
-    emit(col("d",f"   wordlist {WORDLIST.name}   lists {SECLISTS}"))
+    emit(col("d",f"   target {ip}   started {_ts()}"))
+    emit(col("d",f"   lists {SECLISTS}"))
     emit()
 
 def have(tool): return shutil.which(tool) is not None
@@ -167,7 +160,7 @@ CRED_RE = re.compile("|".join([
 SKIP_EXT = {".png",".jpg",".jpeg",".gif",".ico",".pdf",".zip",".gz",".exe",
             ".dll",".so",".bin",".woff",".woff2",".ttf",".mp3",".mp4",".css",".svg"}
 
-def scan_creds(root, report):
+def scan_creds(root):
     root = Path(root); hits = []
     if not root.exists(): return hits
     for f in root.rglob("*"):
@@ -180,32 +173,25 @@ def scan_creds(root, report):
         for i, line in enumerate(text.splitlines(), 1):
             if CRED_RE.search(line):
                 hits.append(f"{f}:{i}: {line.strip()[:200]}")
-    if hits:
-        Path(report).write_text("\n".join(hits))
-        warn(f"{len(hits)} moegliche Credential-Treffer -> {report}")
-        for h in hits[:20]: emit("   "+col("Y",h))
-        if len(hits) > 20: emit(f"   {col('d','... +'+str(len(hits)-20)+' weitere')}")
     return hits
 
-def portscan(ip, out):
+def portscan(ip):
     head("PORT-SCAN")
-    gfile = out/"scans"/"all-ports.gnmap"
     info("full port scan (all 65535 ports)", "nmap")
-    run_live(["nmap","-p-","--min-rate",str(RATE),"-T4","-Pn","-n","-v",
-              "-oG",str(gfile),"-oN",str(out/"scans"/"all-ports.txt"), ip],
+    _, full = run_live(["nmap","-p-","--min-rate",str(RATE),"-T4","-Pn","-n","-v", ip],
              t="nmap", timeout=T_FULLSCAN,
              filt=lambda l: "Discovered open port" in l or "Completed" in l or "scan report" in l)
-    ports = sorted({m.group(1) for m in re.finditer(r"(\d+)/open",
-                    gfile.read_text(errors="replace"))} if gfile.exists() else set(), key=int)
+    ports = sorted({m.group(1) for m in
+                    re.finditer(r"Discovered open port (\d+)/tcp", full)}, key=int)
     if not ports:
         warn("no open tcp ports, trying udp top-50", "nmap")
-        run_live(["nmap","-sU","--top-ports","50","-Pn","-n","-oN",
-                  str(out/"scans"/"udp.txt"), ip], t="nmap", timeout=T_SVCSCAN)
+        run_live(["nmap","-sU","--top-ports","50","-Pn","-n", ip],
+                 t="nmap", timeout=T_SVCSCAN)
         return {}, ""
     ok("Offene Ports: "+col("G",", ".join(ports)), "nmap")
     info("service scan on open ports", "nmap")
-    _, svc = run_live(["nmap","-p",",".join(ports),"-sCV","-Pn","-n","-oN",
-                       str(out/"scans"/"services.txt"), ip], t="nmap", timeout=T_SVCSCAN,
+    _, svc = run_live(["nmap","-p",",".join(ports),"-sCV","-Pn","-n", ip],
+                      t="nmap", timeout=T_SVCSCAN,
                       filt=lambda l: bool(re.match(r"\d+/tcp", l)) or "|" in l)
     svcmap = {}
     for line in svc.splitlines():
@@ -243,7 +229,7 @@ def add_host(ip, host):
 
 def ftp_anon(ip, out):
     info("checking anonymous ftp", "ftp")
-    dest = out/"files"/"ftp"; dest.mkdir(parents=True, exist_ok=True)
+    dest = out/"files"/"ftp"   # erst anlegen, wenn wirklich eine Datei kommt
     try:
         ftp = ftplib.FTP(); ftp.connect(ip, 21, timeout=15)
         ftp.login("anonymous","anonymous@")
@@ -270,14 +256,17 @@ def ftp_anon(ip, out):
     finally:
         try: ftp.quit()
         except Exception: pass
-    ok(f"{n[0]} file(s) -> {dest}", "ftp")
+    if n[0]:
+        ok(f"{n[0]} file(s) -> {dest}", "ftp")
+    else:
+        warn("anon login ok, aber keine Dateien gefunden", "ftp")
 
 def smb_anon(ip, out):
     info("enumerate SMB (139/445)", "smb")
-    dest = out/"files"/"smb"; dest.mkdir(parents=True, exist_ok=True)
+    dest = out/"files"/"smb"   # erst anlegen, wenn wirklich Files geladen werden
     if have("smbmap"):
-        run_live(["smbmap","-H",ip], t="smb", outfile=out/"scans"/"smbmap.txt",
-                 timeout=T_GENERIC, filt=lambda l: "READ" in l or "Disk" in l or "ANONYMOUS" in l)
+        run_live(["smbmap","-H",ip], t="smb", timeout=T_GENERIC,
+                 filt=lambda l: "READ" in l or "Disk" in l or "ANONYMOUS" in l)
     if not have("smbclient"):
         warn("smbclient missing, skipping share grab", "smb"); return
     _, listing = run(["smbclient","-N","-L",f"//{ip}/"], timeout=T_GENERIC)
@@ -291,7 +280,13 @@ def smb_anon(ip, out):
         info(f"grabbing share '{sh}'", "smb")
         run(["smbclient","-N",f"//{ip}/{sh}","-c",
              f"recurse ON; prompt OFF; lcd {sdir}; mget *"], timeout=T_GENERIC)
-    ok(f"SMB-Files -> {dest}", "smb")
+        if not any(sdir.rglob("*")):   # Share war leer / nichts lesbar
+            shutil.rmtree(sdir, ignore_errors=True)
+    if dest.exists() and any(dest.rglob("*")):
+        ok(f"SMB-Files -> {dest}", "smb")
+    else:
+        shutil.rmtree(dest, ignore_errors=True)
+        warn("shares gelistet, aber keine Dateien ladbar", "smb")
 
 def _parse_gobuster(text):
     """-> Liste (path, status, is_dir)."""
@@ -305,20 +300,21 @@ def _parse_gobuster(text):
         res.append((path, st, bool(is_dir)))
     return res
 
-def gobuster_recursive(base, wd, tag, budget):
-    if not (ENABLE_GOBUSTER and have("gobuster") and WORDLIST.exists()):
-        if not have("gobuster"): warn("gobuster missing", tag)
-        return
+def gobuster_recursive(base, tag, budget):
+    """Rekursives gobuster. Treffer -> findings, keine Datei-Dumps."""
+    if not have("gobuster"):
+        warn("gobuster missing", tag); return
+    if not WORDLIST.exists():
+        warn(f"wordlist missing: {WORDLIST}", tag); return
     seen = set(); queue = [(base.rstrip("/")+"/", 0)]
     while queue and budget[0] > 0:
         url, depth = queue.pop(0)
         if url in seen: continue
         seen.add(url); budget[0] -= 1
         wl = WORDLIST if depth == 0 else RECURSE_WORDLIST
-        outf = wd/("gobuster_"+re.sub(r"\W+","_",url).strip("_")+".txt")
         info(f"gobuster d{depth} {url}  ({wl.name})", tag)
         gcmd = ["gobuster","dir","-u",url,"-w",str(wl),"-t",str(THREADS),
-                "-q","-k","--no-error","--timeout","10s","-o",str(outf)]
+                "-q","-k","--no-error","--timeout","10s"]
         if GOBUSTER_EXT: gcmd += ["-x",GOBUSTER_EXT]
         _, txt = run_live(gcmd, t=tag, timeout=T_GOBUSTER, echo=False,
                           filt=lambda l: "Status:" in l)
@@ -330,60 +326,44 @@ def gobuster_recursive(base, wd, tag, budget):
                 if child not in seen:
                     queue.append((child, depth+1))
 
-def vhost_scan(ip, port, scheme, root, wd, tag):
-    if not (ENABLE_VHOST and have("ffuf") and DNS_WORDLIST.exists()): return []
-    outj = wd/"vhosts.json"
-    info(f"vhost fuzzing FUZZ.{root}", tag)
-    run_live(["ffuf","-w",str(DNS_WORDLIST),"-u",f"{scheme}://{ip}:{port}/",
-              "-H",f"Host: FUZZ.{root}","-t",str(THREADS),"-ac","-s",
-              "-of","json","-o",str(outj)], t=tag, timeout=T_GOBUSTER,
-             filt=lambda l: bool(l.strip()))
-    subs = []
-    try:
-        for r in json.loads(outj.read_text()).get("results", []):
-            fz = r.get("input",{}).get("FUZZ")
-            if fz: subs.append(f"{fz}.{root}")
-    except Exception: pass
-    for s in subs: finding("VHOST", s, tag)
-    return subs
+# Spannende Dinge im HTML: Credentials, Flags, Hinweise, Kommentare.
+WEB_HINT_RE = re.compile(
+    r"(?i)(pass(?:word|wd|phrase)?\s*[:=]?\s*\S*"
+    r"|user(?:name)?\s*[:=]?\s*\S*"
+    r"|api[_-]?key|secret|token|auth[_-]?key"
+    r"|flag\{[^}]*\}|todo|fixme|<!--.*?-->)")
 
 def web(ip, port, out, host):
+    """Nur Index holen. Datei wird NUR gespeichert, wenn im HTML etwas Spannendes steckt."""
     tag = f"web:{port}"
     scheme = "https" if port in ("443","8443") else "http"
-    info(f"enumerate web ({scheme})", tag)
-    wd = out/"web"/port; wd.mkdir(parents=True, exist_ok=True)
-    primary = host or ip
-    # Initiale Seite + Hints
-    if have("curl"):
-        for url in ([f"{scheme}://{host}:{port}/"] if host else []) + [f"{scheme}://{ip}:{port}/"]:
-            tagf = re.sub(r"\W+","_",url)
-            _, body = run(["curl","-sk","-m","15","-L",url], wd/f"index_{tagf}.html", timeout=30)
-            run(["curl","-skI","-m","15",url], wd/f"headers_{tagf}.txt", timeout=30)
-            tt = re.search(r"(?is)<title>(.*?)</title>", body)
-            if tt: info(f"{url}  <title> {tt.group(1).strip()[:70]}", tag)
-            for m in list(re.finditer(r"(?i)(password|username|api[_-]?key|todo|flag|<!--.*?-->)", body))[:6]:
-                s = m.group(0).strip().replace("\n"," ")[:120]
-                if s: raw("hint "+s, tag)
-    if not DO_WEBFUZZ:
-        return
-    # vHosts -> /etc/hosts -> auch fuzzen
-    subs = []
-    root = host.split(".",1)[-1] if host and "." in host else (host or "htb")
-    if host:
-        subs = vhost_scan(ip, port, scheme, root, wd, tag)
-        for s in subs: add_host(ip, s)
-    budget = [GOBUSTER_BUDGET]
-    for tgt_host in [primary] + subs:
-        gobuster_recursive(f"{scheme}://{tgt_host}:{port}", wd, tag, budget)
-    # dirsearch (lokal oder im PATH)
-    if ENABLE_DIRSEARCH:
-        base = f"{scheme}://{primary}:{port}"
-        if have("dirsearch"):
-            run_live(["dirsearch","-u",base,"-q","--format=plain","-o",str(wd/"dirsearch.txt")],
-                     t=tag, timeout=T_DIRSRCH, filt=lambda l: "/" in l and "%" not in l)
-        elif (SCRIPT_DIR/"dirsearch"/"dirsearch.py").exists():
-            run_live(["python3",str(SCRIPT_DIR/"dirsearch"/"dirsearch.py"),"-u",base,"-q",
-                      "-o",str(wd/"dirsearch.txt")], t=tag, timeout=T_DIRSRCH)
+    info(f"fetch web index ({scheme})", tag)
+    if not have("curl"):
+        warn("curl missing, skipping web", tag); return
+    seen_urls = set()
+    for url in ([f"{scheme}://{host}:{port}/"] if host else []) + [f"{scheme}://{ip}:{port}/"]:
+        if url in seen_urls: continue
+        seen_urls.add(url)
+        _, body = run(["curl","-sk","-m","15","-L",url], timeout=30)
+        if not body: continue
+        tt = re.search(r"(?is)<title>(.*?)</title>", body)
+        if tt: info(f"{url}  <title> {tt.group(1).strip()[:70]}", tag)
+        hints = []
+        for m in WEB_HINT_RE.finditer(body):
+            s = m.group(0).strip().replace("\n"," ")[:120]
+            if s and s.lower() not in (h.lower() for h in hints): hints.append(s)
+            if len(hints) >= 8: break
+        if not hints:
+            continue  # nichts Spannendes -> keine Datei, kein web-Ordner
+        wd = out/"files"/"web"; wd.mkdir(parents=True, exist_ok=True)
+        tagf = re.sub(r"\W+","_",url).strip("_")
+        page = wd/f"{tagf}.html"
+        page.write_text(body, errors="replace")
+        finding("WEB", f"interesting html at {url} -> {page}", tag)
+        for h in hints: raw("hint "+h, tag)
+    if DO_GOBUSTER:
+        primary = host or ip
+        gobuster_recursive(f"{scheme}://{primary}:{port}", tag, [GOBUSTER_BUDGET])
 
 def kerberos(ip, out, host):
     info("enumerate Kerberos/AD (88)", "krb")
@@ -395,26 +375,33 @@ def kerberos(ip, out, host):
     if not dom:
         warn("domain unknown, set DOMAIN in config, skipping", "krb"); return
     ok(f"Domain: {dom}", "krb")
-    users = out/"users.txt"
-    if have("kerbrute") and USER_WORDLIST.exists():
-        info("kerbrute userenum ...", "krb")
-        _, o = run_live(["kerbrute","userenum","-d",dom,"--dc",ip,str(USER_WORDLIST)],
-                        t="krb", outfile=out/"scans"/"kerbrute.txt", timeout=T_GENERIC,
-                        filt=lambda l: "VALID" in l or "+" in l)
-        found = sorted(set(re.findall(r"VALID USERNAME:\s+([^@\s]+)", o)))
-        if found:
-            users.write_text("\n".join(found)+"\n")
-            finding("KRB", "valid users: "+", ".join(found), "krb")
-    if not users.exists() and USER_WORDLIST.exists():
-        shutil.copy(USER_WORDLIST, users)
-    gnp = shutil.which("GetNPUsers.py") or shutil.which("impacket-GetNPUsers")
-    if gnp and users.exists():
-        info("AS-REP Roasting (GetNPUsers) ...", "krb")
-        _, o = run_live([gnp, f"{dom}/","-no-pass","-dc-ip",ip,"-usersfile",str(users)],
-                        t="krb", outfile=out/"scans"/"asrep.txt", timeout=T_GENERIC,
-                        filt=lambda l: "krb5asrep" in l or "error" in l.lower())
-        if "$krb5asrep$" in o:
-            finding("KRB", "AS-REP Hash -> scans/asrep.txt (hashcat -m 18200)", "krb")
+    tmp = Path(tempfile.mkdtemp(prefix="p4ckrat_krb_"))
+    users = tmp/"users.txt"   # nur Zwischenliste fuer GetNPUsers
+    try:
+        if have("kerbrute") and USER_WORDLIST.exists():
+            info("kerbrute userenum ...", "krb")
+            _, o = run_live(["kerbrute","userenum","-d",dom,"--dc",ip,str(USER_WORDLIST)],
+                            t="krb", timeout=T_GENERIC,
+                            filt=lambda l: "VALID" in l or "+" in l)
+            found = sorted(set(re.findall(r"VALID USERNAME:\s+([^@\s]+)", o)))
+            if found:
+                users.write_text("\n".join(found)+"\n")
+                finding("KRB", "valid users: "+", ".join(found), "krb")
+        if not users.exists() and USER_WORDLIST.exists():
+            shutil.copy(USER_WORDLIST, users)
+        gnp = shutil.which("GetNPUsers.py") or shutil.which("impacket-GetNPUsers")
+        if gnp and users.exists():
+            info("AS-REP Roasting (GetNPUsers) ...", "krb")
+            _, o = run_live([gnp, f"{dom}/","-no-pass","-dc-ip",ip,"-usersfile",str(users)],
+                            t="krb", timeout=T_GENERIC,
+                            filt=lambda l: "krb5asrep" in l or "error" in l.lower())
+            hashes = re.findall(r"\$krb5asrep\$\S+", o)
+            if hashes:   # echter Loot -> files/ anlegen
+                dest = out/"files"; dest.mkdir(parents=True, exist_ok=True)
+                hf = dest/"asrep_hashes.txt"; hf.write_text("\n".join(hashes)+"\n")
+                finding("KRB", f"AS-REP Hash -> {hf} (hashcat -m 18200)", "krb")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 def hydra_prompt(ip, svcmap, out):
     svcs = []
@@ -423,8 +410,7 @@ def hydra_prompt(ip, svcmap, out):
     if not (svcs and have("hydra")):
         if svcs and not have("hydra"): warn("hydra not installed, skipping brute")
         return
-    users = out/"users.txt"
-    ulist = str(users) if users.exists() else str(USER_WORDLIST)
+    ulist = str(USER_WORDLIST)
     emit()
     if not ask(f"run hydra against {', '.join(s for s,_ in svcs)}? "
                +col("d",f"({Path(ulist).name} x {PASS_WORDLIST.name})"), default="n"):
@@ -434,7 +420,7 @@ def hydra_prompt(ip, svcmap, out):
     for name, port in svcs:
         head(f"HYDRA {name}")
         _, o = run_live(["hydra","-L",ulist,"-P",str(PASS_WORDLIST),"-t","4","-f","-I",
-                  "-o",str(out/"scans"/f"hydra-{name}.txt"),f"{name}://{ip}"],
+                  f"{name}://{ip}"],
                  t="hydra", timeout=T_HYDRA, filt=lambda l: "login:" in l or "valid" in l.lower())
         for m in re.finditer(r"login:\s*(\S+)\s+password:\s*(\S+)", o):
             finding("CREDS", f"{name}  {m.group(1)}:{m.group(2)}", "hydra")
@@ -448,23 +434,23 @@ def ask(q, default="n"):
 
 def main():
     if len(sys.argv) < 2:
-        emit(col("G",col("b",BANNER))); emit("\n  Usage: sudo ./p4ckrat.py <IP> [name]\n"); sys.exit(1)
-    ip = sys.argv[1]; name = sys.argv[2] if len(sys.argv) > 2 else ip
-    out = Path("recon")/name
-    for sub in ("scans","files","web"): (out/sub).mkdir(parents=True, exist_ok=True)
+        emit(col("G",col("b",BANNER))); emit("\n  Usage: sudo ./p4ckrat.py <IP>\n"); sys.exit(1)
+    ip = sys.argv[1]
+    out = Path("p4ckrat")          # fester Ordner im aktuellen Verzeichnis
+    out.mkdir(parents=True, exist_ok=True)
 
     logf  = open(out/"p4ckrat.log", "w", encoding="utf-8")
     findf = open(out/"findings.txt", "w", encoding="utf-8")
-    findf.write(f"# p4ckrat findings - {ip} ({name}) - {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+    findf.write(f"# p4ckrat findings - {ip} - {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
     findf.flush()
     set_logs(logf, findf)
 
-    banner(ip, name)
+    banner(ip)
     info(f"live findings  -> {out}/findings.txt", None)
     info(f"full log       -> {out}/p4ckrat.log", None)
     if not have("nmap"): err("nmap missing, abort"); sys.exit(1)
 
-    svcmap, svc = portscan(ip, out)
+    svcmap, svc = portscan(ip)
     if not svcmap:
         warn("no open ports, nothing to do"); return
     finding("PORTS", ", ".join(f"{p}/{svcmap[p][0]}" for p in sorted(svcmap, key=int)))
@@ -475,12 +461,12 @@ def main():
     web_ports = [p for p,(n,_) in svcmap.items()
                  if "http" in n or p in ("80","443","8080","8000","8443","8081")]
 
-    global DO_WEBFUZZ
+    global DO_GOBUSTER
     if web_ports:
-        DO_WEBFUZZ = ask(f"run web fuzzing (gobuster+dirsearch+vhost) on port {', '.join(web_ports)}?",
-                         default="y")
-        if not DO_WEBFUZZ:
-            info("web fuzzing skipped (only index/headers fetched)")
+        DO_GOBUSTER = ask(f"run gobuster (recursive dir fuzz) on port {', '.join(web_ports)}?",
+                          default="y")
+        if not DO_GOBUSTER:
+            info("gobuster skipped (nur index/hints)")
 
     head("ENUM (parallel)")
     workers = list(filter(None,[
@@ -500,16 +486,21 @@ def main():
             except Exception as e: err(f"phase error: {e!r}")
 
     head("CREDENTIAL-SCAN")
-    for h in scan_creds(out/"files", out/"creds_files.txt"): finding("CREDS", h[:160])
-    for h in scan_creds(out/"web",   out/"creds_web.txt"):   finding("CREDS", h[:160])
+    creds = scan_creds(out/"files")
+    if creds:
+        warn(f"{len(creds)} moegliche Credential-Treffer in files/")
+        for h in creds: finding("CREDS", h[:160])
+    else:
+        info("keine Credential-Treffer (files/)")
 
     hydra_prompt(ip, svcmap, out)
 
     head("DONE")
     ok(f"done in {_el()} -> {col('G',str(out))}/")
     info(col("w",f"{out}/findings.txt")+col("d","  (live findings)"))
-    info(col("w",f"{out}/scans/services.txt")+col("d","  ")+col("w",f"{out}/web/")
-         +col("d","  ")+col("w",f"{out}/files/"))
+    info(col("w",f"{out}/p4ckrat.log")+col("d","  (full log)"))
+    if (out/"files").exists():
+        info(col("w",f"{out}/files/")+col("d","  (loot)"))
     emit()
     try: logf.close(); findf.close()
     except Exception: pass
