@@ -1,6 +1,6 @@
 recon/
 __pycache__/
 *.pyc
-
+p4ckrat/
 # persoenliches Changelog (nicht ins Repo)
 CHANGELOG.md

@@ -9,63 +9,60 @@ ______   /  |  |   ____ |  | ______________ _/  |_
 |__|        |__|      \/     \/            \/
 ```
 
-**Full-auto recon & loot grabber for CTF / HackTheBox boxes.**
+**Full-auto recon & loot grabber for CTF / HackTheBox / VulnLab boxes.**
 
-One command and p4ckrat scans the target and enumerates what it finds - all in
-parallel, with live terminal output and a `findings.txt` you can `tail -f`. It
-only writes a file to disk when it actually grabbed something.
+Point it at one IP and p4ckrat scans the box, enumerates every service it finds in
+parallel, grabs any loot it can reach, scans that loot for credentials, and then
+sprays those credentials back at the box to find a foothold — all with live
+terminal output and a `findings.txt` you can `tail -f`.
 
-Covers: nmap port scan (+ optional UDP top-20), FTP/SMB/NFS loot grab, SMB user
-enum (enum4linux-ng / RID cycling), LDAP anonymous bind, SNMP, RPC, Redis, rsync,
-MSSQL/MySQL/PostgreSQL default-cred probes, web index + recursive gobuster + vhost
-fuzzing (+ optional nuclei), Kerberos AS-REP roast, a credential scan of the loot,
-optional hydra brute, and a **credential-spray / pivot** phase that replays every
-found `user:pass` against SSH/SMB/WinRM/FTP.
+What it touches: nmap (TCP + optional UDP), FTP/SMB/NFS loot, SMB/LDAP/RPC/SNMP/
+Redis/rsync enum, DB default-cred probes, web (fingerprint → gobuster → robots/
+sitemap → vhost fuzz → optional nuclei/crawl → default-cred checks), Kerberos
+AS-REP & Kerberoast, searchsploit, SSH-key loot. The highlight is the **credential
+loop**: it harvests passwords from the loot (including prose like *"set the
+password to …"* and AD `description` fields), then sprays **every password against
+every known user** over LDAP/SMB/WinRM (a `must-change` result still counts as a
+valid hit), so a password hidden in one account's notes finds the account it
+actually belongs to.
 
-> by **p4cket** - [github.com/pwl-de](https://github.com/pwl-de)
+> by **p4cket** — [github.com/pwl-de](https://github.com/pwl-de)
 
 ## Usage
 
 ```bash
-sudo ./p4ckrat.py <IP>      # sudo lets it add discovered vhosts to /etc/hosts
+sudo ./p4ckrat.py <IP>
 ```
 
-Flags:
+Example:
 
-| Flag | Effect |
-|------|--------|
-| `-d, --domain <dom>` | force the AD domain (else auto-detect) |
-| `--udp` | also run a parallel UDP top-20 scan (DNS/SNMP/TFTP) |
-| `--nuclei` | run nuclei on discovered web ports |
-| `--no-gobuster` | skip gobuster (no prompt) |
-| `--no-spray` | disable the credential-spray / pivot phase |
-| `-q` / `-v` | quiet (findings only) / verbose (all tool lines + commands) |
-| `--dry-run` | print the commands that *would* run, execute nothing |
+```bash
+sudo ./p4ckrat.py 10.129.82.231 --udp -d baby.vl
+```
 
-Runs on your attacker box (Kali / Pwnbox). Results land in a `p4ckrat/` folder in
-the current directory (`findings.txt`, `p4ckrat.log`, and `files/` if loot was
-found). Two optional y/n prompts: gobuster (after the port scan, default yes) and
-hydra brute (near the end, default no).
+Results land in `./p4ckrat/` (`findings.txt`, `p4ckrat.log`, and `files/` if loot
+was found). `sudo` lets it add discovered vhosts to `/etc/hosts`. Two optional y/n
+prompts: gobuster (after the port scan, default yes) and hydra (near the end,
+default no).
 
-Config knobs (wordlists, threads, timeouts, `/etc/hosts` toggle) are the block at
-the top of `p4ckrat.py`.
+Common flags: `-d DOMAIN`, `--udp`, `--nuclei`, `--crawl`, `--secretsdump`,
+`--no-gobuster`, `--no-spray`, `-q`/`-v`, `--dry-run`. See `./p4ckrat.py -h`.
 
 ## Dependencies
 
-`nmap` is required; everything else is optional and skipped if missing
-(`smbclient`, `smbmap`, `enum4linux-ng`, `rpcclient`, `gobuster`, `ffuf`,
-`nuclei`, `kerbrute`, `impacket-GetNPUsers`, `hydra`, `curl`, `ldapsearch`,
-`snmpwalk`, `showmount`, `redis-cli`, `rsync`, `sshpass`, `netexec`/`nxc`, DB
-clients). FTP grab + cred scan use only the Python stdlib (3.8+).
+`nmap` is required; everything else is optional and skipped if missing (e.g.
+`netexec`, `smbclient`, `enum4linux-ng`, `gobuster`, `ffuf`, `whatweb`, `nuclei`,
+`ldapsearch`, impacket, `hydra`, `searchsploit`, `sshpass`). FTP grab + credential
+scan use only the Python stdlib (3.8+).
 
 ```bash
-sudo apt install -y nmap smbclient smbmap gobuster ffuf hydra seclists \
-                    ldap-utils snmp nfs-common redis-tools rsync sshpass
+sudo apt install -y nmap netexec smbclient enum4linux-ng gobuster ffuf whatweb \
+                    nuclei hydra exploitdb seclists ldap-utils snmp nfs-common \
+                    redis-tools rsync sshpass
 pipx install impacket
-go install github.com/ropnop/kerbrute@latest
 ```
 
 ## Disclaimer
 
-For authorized testing only - CTFs, HackTheBox, labs and boxes you own or have
+For authorized testing only — CTFs, HackTheBox, labs and boxes you own or have
 explicit permission to test.
