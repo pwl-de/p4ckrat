@@ -26,8 +26,25 @@ sudo ./p4ckrat.py <IP>
 sudo ./p4ckrat.py 10.129.82.231 -d baby.vl
 ```
 
-Output lands in `./p4ckrat/` (`findings.txt`, `p4ckrat.log`, `files/`). Run as
-root so it can add discovered vhosts to `/etc/hosts`. Flags: `./p4ckrat.py -h`.
+Output lands in `./p4ckrat/<IP>/` (`findings.txt`, `p4ckrat.log`, `files/`) — one
+folder per target, so a new box never overwrites the previous run. Override with
+`-o DIR`. Run as root so it can add discovered vhosts to `/etc/hosts` (a stale entry
+for a recycled box IP is rewritten, not duplicated).
+
+Useful flags (`./p4ckrat.py -h` for all):
+
+```
+-d DOMAIN      force the AD domain (else auto-detected)
+-o DIR         output directory (default: p4ckrat/<IP>/)
+--udp          also run a parallel UDP top-20 scan
+--nuclei       run nuclei on discovered web ports
+--crawl        crawl web ports with katana/gau
+--secretsdump  run secretsdump once SMB admin access is found
+--no-gobuster  skip the recursive dir fuzz (no prompt)
+--no-spray     disable the credential-spray / pivot phase
+--dry-run      print the commands that would run, execute nothing
+-q / -v        quieter (findings only) / verbose (all tool lines + commands)
+```
 
 ## Dependencies
 
